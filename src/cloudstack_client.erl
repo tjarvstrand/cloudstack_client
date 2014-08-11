@@ -169,7 +169,7 @@ default_config() ->
                                              [{full_result, false}])
                            end,
     secretkey           => "",
-    timeout             => 6000, % 1 min
+    timeout             => 60000, % 1 min
     url                 => ""
    }.
 
