@@ -27,13 +27,17 @@
 
 %%%_* Exports ==================================================================
 
-%% APIr
+%% API
 -export([request/2,
          request/3]).
+
+%% Internal API
+-export([http_request/2]).
 
 %%%_* Includes =================================================================
 
 -include_lib("eunit/include/eunit.hrl").
+
 
 %%%_* Defines ==================================================================
 
@@ -116,19 +120,19 @@ request(Config0, Call, Params) ->
 do_request(Config, Call, Params) ->
   Url = url(Config, Call, Params),
   {ok, {_, _, Host, _, _, _}} = http_uri:parse(Url),
-  log(Config, info, "Issuing ~p to ~s", [Call, Host]),
-  log(Config, debug, "Issuing request to ~p", [Url]),
-  metric(Config, counter, [cloudstack_client, request, issue], 1),
+  log(Config, info, "Issuing ~p to ~s", [Call, Url]),
+  metric(Config, counter, [cloudstack_client, request, Call, issue], 1),
   Start = ms_timestamp(os:timestamp()),
   case call(request_fun, Config, [Url, maps:get(timeout, Config)]) of
     {error, Rsn} = Err            ->
       log(Config, error, "Request Failed: ~p", [Rsn]),
-      metric(Config, counter, [cloudstack_client, request, failure], 1),
+      metric(Config, counter, [cloudstack_client, request, Call, failure], 1),
       Err;
     {ok,   {Resp, Body}} ->
-      metric(Config, counter, [cloudstack_client, request, success], 1),
+      metric(Config, counter, [cloudstack_client, request, Call, success], 1),
       Duration = ms_timestamp(os:timestamp()) - Start,
-      metric(Config, timer, [cloudstack_client, request, duration], Duration),
+      metric(Config, timer, [cloudstack_client, request, Call, duration],
+             Duration),
       log(Config, info, "Request ~p to ~s done with result ~p in ~.2fs",
           [Call, Host, Resp, Duration/1000000]),
       log(Config, debug, "Response Body: ~p", [Body]),
@@ -162,16 +166,17 @@ default_config() ->
                                io:format("~p: " ++ Fmt ++ "\n", [Lvl|Args])
                            end,
     metric_fun          => fun(_, _, _) -> ok end,
-    request_fun         => fun(Url, Timeout) ->
-                               httpc:request(get,
-                                             {Url, []},
-                                             [{timeout, Timeout}],
-                                             [{full_result, false}])
-                           end,
+    request_fun         => fun http_request/2,
     secretkey           => "",
     timeout             => 60000, % 1 min
     url                 => ""
    }.
+
+http_request(Url, Timeout) ->
+  httpc:request(get,
+                {Url, []},
+                [{timeout, Timeout}],
+                [{full_result, false}]).
 
 url(Config, Call, Params0) ->
   Url = maps:get(url, Config),
@@ -183,7 +188,8 @@ url(Config, Call, Params0) ->
                    },
   EncodedParams = params_str(Params),
   Sig = sig_str(maps:get(secretkey, Config), EncodedParams),
-  lists:flatten(io_lib:format("~s?~s&signature=~s", [Url, EncodedParams, Sig])).
+  lists:flatten(io_lib:format("~s?~s&signature=~s",
+                              [Url, space_to_plus(EncodedParams), Sig])).
 
 sig_str(Key, ParamsStr0) ->
   ParamsStr = string:to_lower(ParamsStr0),
@@ -191,10 +197,10 @@ sig_str(Key, ParamsStr0) ->
   space_to_plus(string:strip(http_uri:encode(Base64))).
 
 params_str(Params) ->
-  ParamStrs = maps:fold(fun(K, V, A) ->  [param_str(K, V)| A] end, [], Params),
-  space_to_plus(string:join(lists:sort(ParamStrs), "&")).
+  ParamStrs = lists:filtermap(fun param_str/1, maps:to_list(Params)),
+  string:join(lists:sort(ParamStrs), "&").
 
-param_str(ParentK, ParentV) when is_map(ParentV)     ->
+param_str({ParentK, ParentV}) when is_map(ParentV)     ->
   {_, Res} =
     maps:fold(fun(K, V0, {I, Strs}) ->
                   V = http_uri:encode(param_val_string(V0)),
@@ -205,9 +211,14 @@ param_str(ParentK, ParentV) when is_map(ParentV)     ->
               end,
               {0, ""},
               ParentV),
-  string:join(lists:reverse(Res), "&");
-param_str(K, V) ->
-  param_key_string(K) ++ "=" ++ http_uri:encode(param_val_string(V)).
+  case Res of
+    [] -> false;
+    _  -> {true, string:join(lists:reverse(Res), "&")}
+  end;
+param_str({_K, ""}) ->
+  false;
+param_str({K, V}) ->
+  {true, param_key_string(K) ++ "=" ++ http_uri:encode(param_val_string(V))}.
 
 param_key_string(K) ->
   string:to_lower(atom_to_list(K)).
@@ -273,18 +284,21 @@ param_key_string_test_() ->
   ].
 
 param_val_string_test_() ->
-  [?_assertEqual("foo=bar",  param_str(foo, "bar")),
-   ?_assertEqual("foo=true", param_str(foo, true)),
-   ?_assertEqual("foo=1",    param_str(foo, 1)),
-   ?_assertEqual("foo=1.00", param_str(foo, 1.0)),
-   ?_assertEqual("foo[0].key=bar&foo[0].value=ba%26z&"
-                 "foo[1].key=baz&foo[1].value=bam",
-                 param_str(foo, #{bar => "ba&z", baz => "bam"})),
-   ?_assertEqual("foo=a%2Cb", param_str(foo, ["a","b"]))
+  [?_assertEqual(false,              param_str({foo, []})),
+   ?_assertEqual(false,              param_str({foo, #{}})),
+   ?_assertEqual({true, "foo=bar"},  param_str({foo, "bar"})),
+   ?_assertEqual({true, "foo=true"}, param_str({foo, true})),
+   ?_assertEqual({true, "foo=1"},    param_str({foo, 1})),
+   ?_assertEqual({true, "foo=1.00"}, param_str({foo, 1.0})),
+   ?_assertEqual({true,
+                  "foo[0].key=bar&foo[0].value=ba%26z&"
+                  "foo[1].key=baz&foo[1].value=bam"},
+                 param_str({foo, #{bar => "ba&z", baz => "bam"}})),
+   ?_assertEqual({true, "foo=a%2Cb"}, param_str({foo, ["a","b"]}))
   ].
 
 params_str_test_() ->
-  [?_assertEqual("baz=b+am&foo=bar",
+  [?_assertEqual("baz=b%20am&foo=bar",
                  params_str(#{foo => "bar", baz => "b am"}))
   ].
 
@@ -309,6 +323,9 @@ url_test_() ->
                  "JhZQDFRY%2FGhcsGTM0yovekUVE%3D",
                  url(Config, 'listNetworks', #{}))
   ].
+
+http_request_test_() ->
+  [?_assertEqual({error, no_scheme}, http_request("fooo", 0))].
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:
